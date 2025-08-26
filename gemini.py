@@ -9,12 +9,14 @@ import random
 import requests
 from google.api_core import exceptions as gcloud_exceptions
 from gspread.exceptions import APIError as GSpreadAPIError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 SPREADSHEET_ID = '1wtIZ2MAVp7CaL180l38xEHxtrhc9hZveuTdrNWpmW6g'  # From the URL
 SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', './snyk-cx-se-demo-0ce146967b8c.json')
 DOCS_DIR = './docs'  # Folder containing documents (PDFs, spreadsheets) to provide as context
+MAX_WORKERS = int(os.getenv('GEMINI_MAX_WORKERS', '4'))  # Concurrency for Gemini requests
 
 # Track auth mode for help messages
 ACTIVE_AUTH = None  # "service_account" | "oauth"
@@ -139,6 +141,30 @@ def generate_with_retry(model_obj, inputs, max_attempts: int = 5):
             _backoff_sleep(attempt)
             attempt += 1
 
+def _normalize_compliance_statement(compliance_statement: str, allowed_doc_names):
+    """Normalize model output to either a valid statement or 'not_found'."""
+    if not compliance_statement:
+        return 'not_found'
+
+    normalized_reply = compliance_statement.strip().lower()
+    not_found_indicators = [
+        'not_found',
+        'insufficient information',
+        'insufficient evidence',
+        'cannot be found',
+        'not found in the provided documents',
+    ]
+    if (not normalized_reply) or any(ind in normalized_reply for ind in not_found_indicators):
+        return 'not_found'
+
+    # Enforce that cited document is among uploaded files; otherwise mark as not_found
+    if allowed_doc_names:
+        lower_stmt = compliance_statement.lower()
+        if not any(name and name.lower() in lower_stmt for name in allowed_doc_names):
+            return 'not_found'
+
+    return compliance_statement
+
 def update_cell_with_retry(sheet, row: int, col: int, value: str, max_attempts: int = 5):
     attempt = 1
     current_sheet = sheet
@@ -254,22 +280,28 @@ def process_requirements():
     all_records = sheet.get_all_records()
     
     print(f"Found {len(all_records)} requirements to process")
-    
-    for i, record in enumerate(all_records, start=2):  # Start at row 2 (skip header)
-        requirement_text = record.get('Requirement', '')  # Adjust column name as needed
-        
-        # Skip if already processed or empty
+
+    # Collect rows to process
+    rows_to_process = []  # list[(row_index, requirement_text)]
+    for i, record in enumerate(all_records, start=2):
+        requirement_text = record.get('Requirement', '')
         if record.get('Compliance Statement', '') or not requirement_text:
             print(f"Skipping row {i} - already processed or empty")
             continue
-        
-        print(f"Processing row {i}: {requirement_text[:50]}...")
-        
-        # Create prompt for Gemini
-        prompt = f"""
+        rows_to_process.append((i, requirement_text))
+
+    if not rows_to_process:
+        print("No new requirements to process.")
+        print("Processing complete!")
+        return
+
+    print(f"Submitting {len(rows_to_process)} rows to Gemini (max_workers={MAX_WORKERS})...")
+
+    def _build_prompt(req_text: str) -> str:
+        return f"""
 Using only the provided documents as sources, evaluate this requirement:
 
-"{requirement_text}"
+"{req_text}"
 
 Provide a compliance statement in this exact format:
 "[Compliant/Non-compliant/Partially Compliant] - [brief reasoning] (Reference: [Document name], Page [number], Section [if applicable])"
@@ -282,49 +314,44 @@ not_found
 Allowed document names (you must cite exactly one of these when providing a reference):
 {allowed_doc_names_text}
 """
-        
-        try:
-            # Send to Gemini with attached files context when available (with retries)
-            inputs = [prompt] + provided_files if provided_files else [prompt]
-            response = generate_with_retry(model, inputs)
-            compliance_statement = response.text.strip()
 
-            # Normalize to not_found when model indicates no evidence
-            normalized_reply = compliance_statement.strip().lower()
-            not_found_indicators = [
-                'not_found',
-                'insufficient information',
-                'insufficient evidence',
-                'cannot be found',
-                'not found in the provided documents',
-            ]
-            if (not normalized_reply) or any(ind in normalized_reply for ind in not_found_indicators):
-                compliance_statement = 'not_found'
-            
-            # Enforce that cited document is among uploaded files; otherwise mark as not_found
-            if compliance_statement.lower() != 'not_found' and allowed_doc_names:
-                lower_stmt = compliance_statement.lower()
-                if not any(name and name.lower() in lower_stmt for name in allowed_doc_names):
-                    compliance_statement = 'not_found'
+    def _worker_generate(req_text: str) -> str:
+        prompt = _build_prompt(req_text)
+        inputs = [prompt] + provided_files if provided_files else [prompt]
+        # Create a local model instance per thread for safety
+        local_model = genai.GenerativeModel('gemini-1.5-pro')
+        response = generate_with_retry(local_model, inputs)
+        compliance_statement = getattr(response, 'text', '')
+        compliance_statement = compliance_statement.strip() if compliance_statement else ''
+        return _normalize_compliance_statement(compliance_statement, allowed_doc_names)
 
-            # Update the Google Sheet (with retries)
-            # Assuming 'Compliance Statement' is in column B
-            sheet = update_cell_with_retry(sheet, i, 2, compliance_statement)  # Column B = 2
-            
-            print(f"✓ Updated row {i}")
-            
-            # Rate limiting - be nice to the APIs
-            time.sleep(2)
-            
-        except Exception as e:
-            error_msg = f"ERROR: {str(e)}"
+    # Run Gemini generations concurrently
+    results = {}  # row_index -> value
+    with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as executor:
+        future_to_row = {
+            executor.submit(_worker_generate, req_text): row
+            for (row, req_text) in rows_to_process
+        }
+        for future in as_completed(future_to_row):
+            row = future_to_row[future]
             try:
-                sheet = update_cell_with_retry(sheet, i, 2, error_msg)
-            except Exception as e2:
-                print(f"Failed to write error to sheet on retry: {e2}")
-            print(f"✗ Error on row {i}: {e}")
-            time.sleep(1)
-    
+                value = future.result()
+            except Exception as e:
+                value = f"ERROR: {e}"
+            results[row] = value
+            print(f"✓ Gemini completed for row {row}")
+
+    # Write results back to Google Sheets sequentially (safer for gspread)
+    for row in sorted(results.keys()):
+        value = results[row]
+        try:
+            sheet = update_cell_with_retry(sheet, row, 2, value)
+            print(f"✓ Updated row {row}")
+            time.sleep(0.5)  # gentle pacing for Sheets API
+        except Exception as e:
+            print(f"✗ Error updating row {row}: {e}")
+            time.sleep(0.5)
+
     print("Processing complete!")
 
 def setup_instructions():
