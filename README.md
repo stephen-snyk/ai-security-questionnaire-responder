@@ -32,7 +32,7 @@ This tool allows you to upload documents from https://trust.synk.io (or anywhere
          * 'Compliance_Statement'
     
     5. INSTALL REQUIRED PACKAGES:
-       - Create a virtual environment, 'python3 -m venv ai-security-questionnaire-responder'
+       - Create a virtual environment, 'python3 -m venv ai-security-questionnaire-responder-env'
        - Activate it, 'source ai-security-questionnaire-responder-env/bin/activate'
        - Install requirements 'pip install gspread google-auth google-generativeai'
     
