@@ -13,10 +13,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-SPREADSHEET_ID = '1wtIZ2MAVp7CaL180l38xEHxtrhc9hZveuTdrNWpmW6g'  # From the URL
+# Allow overriding spreadsheet and worksheet via environment variables for flexibility
+SPREADSHEET_ID = os.getenv('SPREADSHEET_ID', '1pm0m9UKfGNpXq-9df2n09Z8B9IT9J8TsE6Of6lbUGFI')
+WORKSHEET_INDEX = int(os.getenv('WORKSHEET_INDEX', '0'))
 SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_APPLICATION_CREDENTIALS', './snyk-cx-se-demo-0ce146967b8c.json')
 DOCS_DIR = './docs'  # Folder containing documents (PDFs, spreadsheets) to provide as context
-MAX_WORKERS = int(os.getenv('GEMINI_MAX_WORKERS', '4'))  # Concurrency for Gemini requests
+MAX_WORKERS = int(os.getenv('GEMINI_MAX_WORKERS', '8'))  # Concurrency for Gemini requests
+VERIFY_WRITES = os.getenv('VERIFY_WRITES', 'false').lower() in {'1', 'true', 'yes'}
 
 # Track auth mode for help messages
 ACTIVE_AUTH = None  # "service_account" | "oauth"
@@ -26,7 +29,6 @@ SERVICE_ACCOUNT_EMAIL = None
 if not GEMINI_API_KEY:
     raise SystemExit("GEMINI_API_KEY is not set. Export it and re-run.")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-pro')
 
 # Set up Google Sheets access
 SCOPES = [
@@ -182,10 +184,34 @@ def update_cell_with_retry(sheet, row: int, col: int, value: str, max_attempts: 
             try:
                 spreadsheet_re = client_re.open_by_key(SPREADSHEET_ID)
                 worksheets_re = spreadsheet_re.worksheets()
-                current_sheet = worksheets_re[0]
+                # Keep the same worksheet index if possible
+                idx = WORKSHEET_INDEX if 0 <= WORKSHEET_INDEX < len(worksheets_re) else 0
+                current_sheet = worksheets_re[idx]
             except Exception as open_err:
                 print(f"Failed to reopen spreadsheet during retry: {open_err}")
             attempt += 1
+
+def _find_header_column_index(sheet, possible_names):
+    """Return 1-based column index by matching headers case-insensitively; None if not found."""
+    try:
+        headers = sheet.row_values(1)
+    except Exception as _:
+        return None
+    normalized_headers = [h.strip().lower() for h in headers]
+    for name in possible_names:
+        lower = name.strip().lower()
+        if lower in normalized_headers:
+            return normalized_headers.index(lower) + 1
+    return None
+
+def _column_index_to_letter(index_one_based: int):
+    """Convert 1-based column index to A1 column letter(s)."""
+    result = ""
+    n = int(index_one_based)
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 def setup_sheets_client():
     """Initialize Google Sheets client.
@@ -245,9 +271,14 @@ def process_requirements():
         worksheets = spreadsheet.worksheets()
         print(f"Available sheets: {[ws.title for ws in worksheets]}")
         
-        # Use first sheet
-        sheet = worksheets[0]
-        print(f"Using sheet: {sheet.title}")
+        # Use selected worksheet index
+        if WORKSHEET_INDEX < 0 or WORKSHEET_INDEX >= len(worksheets):
+            print(f"WORKSHEET_INDEX {WORKSHEET_INDEX} out of range, defaulting to 0")
+            selected_index = 0
+        else:
+            selected_index = WORKSHEET_INDEX
+        sheet = worksheets[selected_index]
+        print(f"Using sheet: {sheet.title} (index {selected_index})")
         
     except Exception as e:
         print(f"Error opening spreadsheet: {e}")
@@ -276,19 +307,48 @@ def process_requirements():
         allowed_doc_names = [n for n in allowed_doc_names if n]
     allowed_doc_names_text = "\n".join(f"- {n}" for n in allowed_doc_names) if allowed_doc_names else ""
     
-    # Get all data
-    all_records = sheet.get_all_records()
-    
-    print(f"Found {len(all_records)} requirements to process")
+    # Resolve column indexes dynamically by header
+    requirement_col_index = _find_header_column_index(sheet, [
+        'Requirement',
+        'requirement',
+    ])
+    compliance_col_index = _find_header_column_index(sheet, [
+        'Compliance Statement',
+        'Compliance_Statement',
+        'compliance statement',
+        'compliance_statement',
+    ])
 
-    # Collect rows to process
+    if requirement_col_index is None:
+        print("Could not find 'Requirement' column header. Please ensure row 1 has a 'Requirement' header.")
+        return
+    if compliance_col_index is None:
+        print("Could not find 'Compliance Statement' column header. Please ensure row 1 has a 'Compliance Statement' header.")
+        return
+    print(f"Detected columns -> Requirement: {requirement_col_index}, Compliance: {compliance_col_index}")
+
+    # Collect rows to process by reading raw columns to preserve physical row numbers
     rows_to_process = []  # list[(row_index, requirement_text)]
-    for i, record in enumerate(all_records, start=2):
-        requirement_text = record.get('Requirement', '')
-        if record.get('Compliance Statement', '') or not requirement_text:
-            print(f"Skipping row {i} - already processed or empty")
+    try:
+        requirement_col_values = sheet.col_values(requirement_col_index)
+        compliance_col_values = sheet.col_values(compliance_col_index)
+    except Exception as e:
+        print(f"Failed to read column values: {e}")
+        return
+
+    # Ensure both lists cover the same number of rows for safe indexing
+    max_len = max(len(requirement_col_values), len(compliance_col_values))
+    # Pad lists to max_len
+    requirement_col_values += [''] * (max_len - len(requirement_col_values))
+    compliance_col_values += [''] * (max_len - len(compliance_col_values))
+
+    for physical_row in range(2, max_len + 1):  # start from row 2 (after header)
+        requirement_text = requirement_col_values[physical_row - 1]
+        compliance_value = compliance_col_values[physical_row - 1]
+        if (not requirement_text or not requirement_text.strip()) or (compliance_value and compliance_value.strip()):
+            print(f"Skipping row {physical_row} - already processed or empty")
             continue
-        rows_to_process.append((i, requirement_text))
+        rows_to_process.append((physical_row, requirement_text))
 
     if not rows_to_process:
         print("No new requirements to process.")
@@ -302,6 +362,16 @@ def process_requirements():
 Using only the provided documents as sources, evaluate this requirement:
 
 "{req_text}"
+
+#PROMPTS
+
+- Use only the provided documents; do not use external knowledge.
+- Choose exactly one source. Prefer in this order when multiple match: SOC 2 report > ISO Statement of Applicability > policy/procedure > overview/FAQ.
+- Ground the reasoning in a specific clause/section; be concrete, not generic.
+- Keep the entire response on a single line (no newlines).
+- Keep the reasoning concise (≤ 40 words).
+- If the requirement is multi-part and only some parts are covered, answer Partially Compliant and name the covered parts succinctly.
+- If you cannot confidently cite one Allowed document name verbatim with a page (and section when applicable), respond with exactly: not_found.
 
 Provide a compliance statement in this exact format:
 "[Compliant/Non-compliant/Partially Compliant] - [brief reasoning] (Reference: [Document name], Page [number], Section [if applicable])"
@@ -325,8 +395,7 @@ Allowed document names (you must cite exactly one of these when providing a refe
         compliance_statement = compliance_statement.strip() if compliance_statement else ''
         return _normalize_compliance_statement(compliance_statement, allowed_doc_names)
 
-    # Run Gemini generations concurrently
-    results = {}  # row_index -> value
+    # Run Gemini generations concurrently and write each result as it completes
     with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS)) as executor:
         future_to_row = {
             executor.submit(_worker_generate, req_text): row
@@ -338,60 +407,28 @@ Allowed document names (you must cite exactly one of these when providing a refe
                 value = future.result()
             except Exception as e:
                 value = f"ERROR: {e}"
-            results[row] = value
             print(f"✓ Gemini completed for row {row}")
-
-    # Write results back to Google Sheets sequentially (safer for gspread)
-    for row in sorted(results.keys()):
-        value = results[row]
-        try:
-            sheet = update_cell_with_retry(sheet, row, 2, value)
-            print(f"✓ Updated row {row}")
-            time.sleep(0.5)  # gentle pacing for Sheets API
-        except Exception as e:
-            print(f"✗ Error updating row {row}: {e}")
-            time.sleep(0.5)
+            try:
+                sheet = update_cell_with_retry(sheet, row, compliance_col_index, value)
+                # Optional verification and A1 fallback
+                if VERIFY_WRITES:
+                    try:
+                        read_back = sheet.cell(row, compliance_col_index).value or ''
+                        if not read_back.strip():
+                            col_letter = _column_index_to_letter(compliance_col_index)
+                            a1 = f"{col_letter}{row}"
+                            print(f"Write verification failed for row {row}. Retrying with range update at {a1}...")
+                            sheet.update(a1, [[value]])
+                    except Exception as _verify_err:
+                        print(f"Verification error for row {row}: {_verify_err}")
+                print(f"✓ Updated row {row}")
+                time.sleep(0.5)  # gentle pacing for Sheets API
+            except Exception as e:
+                print(f"✗ Error updating row {row}: {e}")
+                time.sleep(0.5)
 
     print("Processing complete!")
 
-def setup_instructions():
-    """Print setup instructions"""
-    print("""
-    SETUP INSTRUCTIONS:
-    
-    1. GET GEMINI API KEY:
-       - Go to https://aistudio.google.com/app/apikey
-       - Create a new API key
-       - Replace 'your-gemini-api-key-here' in the script
-    
-    2. SETUP GOOGLE SHEETS API:
-       - Go to https://console.cloud.google.com/
-       - Create/select a project
-       - Enable Google Sheets API and Google Drive API
-       - Create Service Account credentials
-       - Download the JSON key file
-       - Share your Google Sheet with the service account email
-    
-    3. GET SPREADSHEET ID:
-       - From your Google Sheets URL: 
-         https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit
-       - Copy the SPREADSHEET_ID part
-    
-    4. UPDATE COLUMN NAMES:
-       - Make sure your sheet has columns named:
-         * 'Requirement' (or update line 35)
-         * 'Compliance_Statement' (or update line 38 and 58)
-    
-    5. INSTALL REQUIRED PACKAGES:
-       pip install gspread google-auth google-generativeai
-    
-    6. FIRST: Upload your PDFs to Gemini in the web interface
-       Then run this script to process all requirements
-    """)
-
 if __name__ == "__main__":
-    # Comment out setup_instructions to stop seeing them
-    # setup_instructions()
-    
     # Run the actual processing
     process_requirements()
